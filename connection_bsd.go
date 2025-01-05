@@ -1,39 +1,57 @@
-// Copyright (c) 2021 Andy Pan
+// Copyright (c) 2021 The Gnet Authors. All rights reserved.
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// +build freebsd dragonfly darwin
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 
 package gnet
 
-import "github.com/panjf2000/gnet/internal/netpoll"
+import (
+	"io"
 
-func (c *conn) handleEvents(filter int16) (err error) {
+	"golang.org/x/sys/unix"
+
+	"github.com/panjf2000/gnet/v2/pkg/netpoll"
+)
+
+func (c *conn) processIO(_ int, filter netpoll.IOEvent, flags netpoll.IOFlags) (err error) {
+	el := c.loop
 	switch filter {
-	case netpoll.EVFilterSock:
-		err = c.loop.loopCloseConn(c, nil)
-	case netpoll.EVFilterWrite:
-		if !c.outboundBuffer.IsEmpty() {
-			err = c.loop.loopWrite(c)
+	case unix.EVFILT_READ:
+		err = el.read(c)
+	case unix.EVFILT_WRITE:
+		err = el.write(c)
+	}
+	// EV_EOF indicates that the remote has closed the connection.
+	// We check for EV_EOF after processing the read/write event
+	// to ensure that nothing is left out on this event filter.
+	if flags&unix.EV_EOF != 0 && c.opened && err == nil {
+		switch filter {
+		case unix.EVFILT_READ:
+			// Received the event of EVFILT_READ|EV_EOF, but the previous eventloop.read
+			// failed to drain the socket buffer, so we make sure we get it done this time.
+			c.isEOF = true
+			err = el.read(c)
+		case unix.EVFILT_WRITE:
+			// On macOS, the kqueue in either LT or ET mode will notify with one event for the
+			// EOF of the TCP remote: EVFILT_READ|EV_ADD|EV_CLEAR|EV_EOF. But for some reason,
+			// two events will be issued in ET mode for the EOF of the Unix remote in this order:
+			// 1) EVFILT_WRITE|EV_ADD|EV_CLEAR|EV_EOF, 2) EVFILT_READ|EV_ADD|EV_CLEAR|EV_EOF.
+			err = el.write(c)
+		default:
+			c.outboundBuffer.Release() // don't bother to write to a connection that is already broken
+			err = el.close(c, io.EOF)
 		}
-	case netpoll.EVFilterRead:
-		err = c.loop.loopRead(c)
 	}
 	return
 }

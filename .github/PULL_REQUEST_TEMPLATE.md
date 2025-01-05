@@ -1,20 +1,12 @@
----
-name: Pull request
-about: Propose changes to the code
-title: ''
-labels: ''
-assignees: ''
----
-
 <!--
-Thank you for contributing to `ants`! Please fill this out to help us make the most of your pull request.
+Thank you for contributing to `gnet`! Please fill this out to help us review your pull request more efficiently.
 
 Was this change discussed in an issue first? That can help save time in case the change is not a good fit for the project. Not all pull requests get merged.
 
 It is not uncommon for pull requests to go through several, iterative reviews. Please be patient with us! Every reviewer is a volunteer, and each has their own style.
 -->
 
-## 1. Are you opening this pull request for bug-fixs, optimizations or new feature?
+## 1. Are you opening this pull request for bug-fix, optimization or new feature?
 
 
 
@@ -28,7 +20,7 @@ It is not uncommon for pull requests to go through several, iterative reviews. P
 
 
 
-## 4. Which documentation changes (if any) need to be made/updated because of this PR?
+## 4. What documentation changes (if any) need to be made/updated because of this PR?
 <!-- Reviewers will often reference this first in order to know what to expect from the change. Please be specific enough so that they can paste your wording into the documentation directly. -->
 
 

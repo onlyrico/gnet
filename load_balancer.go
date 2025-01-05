@@ -1,22 +1,16 @@
-// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2019 The Gnet Authors. All rights reserved.
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package gnet
 
@@ -24,10 +18,10 @@ import (
 	"hash/crc32"
 	"net"
 
-	"github.com/panjf2000/gnet/internal"
+	"github.com/panjf2000/gnet/v2/pkg/bs"
 )
 
-// LoadBalancing represents the the type of load-balancing algorithm.
+// LoadBalancing represents the type of load-balancing algorithm.
 type LoadBalancing int
 
 const (
@@ -38,57 +32,62 @@ const (
 	// serving the least number of active connections at the current time.
 	LeastConnections
 
-	// SourceAddrHash assignes the next accepted connection to the event-loop by hashing the remote address.
+	// SourceAddrHash assigns the next accepted connection to the event-loop by hashing the remote address.
 	SourceAddrHash
 )
 
 type (
-	// loadBalancer is a interface which manipulates the event-loop set.
+	// loadBalancer is an interface which manipulates the event-loop set.
 	loadBalancer interface {
 		register(*eventloop)
 		next(net.Addr) *eventloop
+		index(int) *eventloop
 		iterate(func(int, *eventloop) bool)
 		len() int
 	}
 
+	// baseLoadBalancer with base lb.
+	baseLoadBalancer struct {
+		eventLoops []*eventloop
+		size       int
+	}
+
 	// roundRobinLoadBalancer with Round-Robin algorithm.
 	roundRobinLoadBalancer struct {
-		nextLoopIndex int
-		eventLoops    []*eventloop
-		size          int
+		baseLoadBalancer
+		nextIndex uint64
 	}
 
 	// leastConnectionsLoadBalancer with Least-Connections algorithm.
 	leastConnectionsLoadBalancer struct {
-		eventLoops []*eventloop
-		size       int
+		baseLoadBalancer
 	}
 
 	// sourceAddrHashLoadBalancer with Hash algorithm.
 	sourceAddrHashLoadBalancer struct {
-		eventLoops []*eventloop
-		size       int
+		baseLoadBalancer
 	}
 )
 
-// ==================================== Implementation of Round-Robin load-balancer ====================================
+// ==================================== Implementation of base load-balancer ====================================
 
-func (lb *roundRobinLoadBalancer) register(el *eventloop) {
+// register adds a new eventloop into load-balancer.
+func (lb *baseLoadBalancer) register(el *eventloop) {
 	el.idx = lb.size
 	lb.eventLoops = append(lb.eventLoops, el)
 	lb.size++
 }
 
-// next returns the eligible event-loop based on Round-Robin algorithm.
-func (lb *roundRobinLoadBalancer) next(_ net.Addr) (el *eventloop) {
-	el = lb.eventLoops[lb.nextLoopIndex]
-	if lb.nextLoopIndex++; lb.nextLoopIndex >= lb.size {
-		lb.nextLoopIndex = 0
+// index returns the eligible eventloop by index.
+func (lb *baseLoadBalancer) index(i int) *eventloop {
+	if i >= lb.size {
+		return nil
 	}
-	return
+	return lb.eventLoops[i]
 }
 
-func (lb *roundRobinLoadBalancer) iterate(f func(int, *eventloop) bool) {
+// iterate iterates all the eventloops.
+func (lb *baseLoadBalancer) iterate(f func(int, *eventloop) bool) {
 	for i, el := range lb.eventLoops {
 		if !f(i, el) {
 			break
@@ -96,17 +95,27 @@ func (lb *roundRobinLoadBalancer) iterate(f func(int, *eventloop) bool) {
 	}
 }
 
-func (lb *roundRobinLoadBalancer) len() int {
+// len returns the length of event-loop list.
+func (lb *baseLoadBalancer) len() int {
 	return lb.size
+}
+
+// ==================================== Implementation of Round-Robin load-balancer ====================================
+
+// next returns the eligible event-loop based on Round-Robin algorithm.
+func (lb *roundRobinLoadBalancer) next(_ net.Addr) (el *eventloop) {
+	el = lb.eventLoops[lb.nextIndex%uint64(lb.size)]
+	lb.nextIndex++
+	return
 }
 
 // ================================= Implementation of Least-Connections load-balancer =================================
 
-func (lb *leastConnectionsLoadBalancer) min() (el *eventloop) {
+func (lb *leastConnectionsLoadBalancer) next(_ net.Addr) (el *eventloop) {
 	el = lb.eventLoops[0]
-	minN := el.loadConn()
+	minN := el.countConn()
 	for _, v := range lb.eventLoops[1:] {
-		if n := v.loadConn(); n < minN {
+		if n := v.countConn(); n < minN {
 			minN = n
 			el = v
 		}
@@ -114,40 +123,11 @@ func (lb *leastConnectionsLoadBalancer) min() (el *eventloop) {
 	return
 }
 
-func (lb *leastConnectionsLoadBalancer) register(el *eventloop) {
-	el.idx = lb.size
-	lb.eventLoops = append(lb.eventLoops, el)
-	lb.size++
-}
-
-// next returns the eligible event-loop by taking the root node from minimum heap based on Least-Connections algorithm.
-func (lb *leastConnectionsLoadBalancer) next(_ net.Addr) (el *eventloop) {
-	return lb.min()
-}
-
-func (lb *leastConnectionsLoadBalancer) iterate(f func(int, *eventloop) bool) {
-	for i, el := range lb.eventLoops {
-		if !f(i, el) {
-			break
-		}
-	}
-}
-
-func (lb *leastConnectionsLoadBalancer) len() int {
-	return lb.size
-}
-
 // ======================================= Implementation of Hash load-balancer ========================================
 
-func (lb *sourceAddrHashLoadBalancer) register(el *eventloop) {
-	el.idx = lb.size
-	lb.eventLoops = append(lb.eventLoops, el)
-	lb.size++
-}
-
-// hash hashes a string to a unique hash code.
-func (lb *sourceAddrHashLoadBalancer) hash(s string) int {
-	v := int(crc32.ChecksumIEEE(internal.StringToBytes(s)))
+// hash converts a string to a unique hash code.
+func (*sourceAddrHashLoadBalancer) hash(s string) int {
+	v := int(crc32.ChecksumIEEE(bs.StringToBytes(s)))
 	if v >= 0 {
 		return v
 	}
@@ -158,16 +138,4 @@ func (lb *sourceAddrHashLoadBalancer) hash(s string) int {
 func (lb *sourceAddrHashLoadBalancer) next(netAddr net.Addr) *eventloop {
 	hashCode := lb.hash(netAddr.String())
 	return lb.eventLoops[hashCode%lb.size]
-}
-
-func (lb *sourceAddrHashLoadBalancer) iterate(f func(int, *eventloop) bool) {
-	for i, el := range lb.eventLoops {
-		if !f(i, el) {
-			break
-		}
-	}
-}
-
-func (lb *sourceAddrHashLoadBalancer) len() int {
-	return lb.size
 }

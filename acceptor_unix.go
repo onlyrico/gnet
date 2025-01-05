@@ -1,84 +1,94 @@
-// Copyright (c) 2021 Andy Pan
+// Copyright (c) 2021 The Gnet Authors. All rights reserved.
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// +build linux freebsd dragonfly darwin
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
 package gnet
 
 import (
-	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 
-	"github.com/panjf2000/gnet/errors"
-	"github.com/panjf2000/gnet/internal/netpoll"
-	"github.com/panjf2000/gnet/internal/socket"
+	"github.com/panjf2000/gnet/v2/pkg/errors"
+	"github.com/panjf2000/gnet/v2/pkg/netpoll"
+	"github.com/panjf2000/gnet/v2/pkg/queue"
+	"github.com/panjf2000/gnet/v2/pkg/socket"
 )
 
-func (svr *server) acceptNewConnection(_ netpoll.IOEvent) error {
-	nfd, sa, err := unix.Accept(svr.ln.fd)
-	if err != nil {
-		if err == unix.EAGAIN {
+func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error {
+	for {
+		nfd, sa, err := socket.Accept(fd)
+		switch err {
+		case nil:
+		case unix.EAGAIN: // the Accept queue has been drained out, we can return now
 			return nil
+		case unix.EINTR, unix.ECONNRESET, unix.ECONNABORTED:
+			// ECONNRESET or ECONNABORTED could indicate that a socket
+			// in the Accept queue was closed before we Accept()ed it.
+			// It's a silly error, let's retry it.
+			continue
+		default:
+			el.getLogger().Errorf("Accept() failed due to error: %v", err)
+			return errors.ErrAcceptSocket
 		}
-		svr.opts.Logger.Errorf("Accept() fails due to error: %v", err)
-		return errors.ErrAcceptSocket
-	}
-	if err = os.NewSyscallError("fcntl nonblock", unix.SetNonblock(nfd, true)); err != nil {
-		return err
-	}
 
-	netAddr := socket.SockaddrToTCPOrUnixAddr(sa)
-	el := svr.lb.next(netAddr)
-	c := newTCPConn(nfd, el, sa, netAddr)
+		remoteAddr := socket.SockaddrToTCPOrUnixAddr(sa)
+		if el.engine.opts.TCPKeepAlive > 0 && el.listeners[fd].network == "tcp" {
+			err = socket.SetKeepAlivePeriod(nfd, int(el.engine.opts.TCPKeepAlive.Seconds()))
+			if err != nil {
+				el.getLogger().Errorf("failed to set TCP keepalive on fd=%d: %v", fd, err)
+			}
+		}
 
-	err = el.poller.UrgentTrigger(el.loopRegister, c)
-	if err != nil {
-		_ = unix.Close(nfd)
-		c.releaseTCP()
+		el := el.engine.eventLoops.next(remoteAddr)
+		c := newTCPConn(nfd, el, sa, el.listeners[fd].addr, remoteAddr)
+		err = el.poller.Trigger(queue.HighPriority, el.register, c)
+		if err != nil {
+			el.getLogger().Errorf("failed to enqueue the accepted socket fd=%d to poller: %v", c.fd, err)
+			_ = unix.Close(nfd)
+			c.release()
+		}
 	}
-	return nil
 }
 
-func (el *eventloop) loopAccept(_ netpoll.IOEvent) error {
-	if el.ln.network == "udp" {
-		return el.loopReadUDP(el.ln.fd)
+func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) error {
+	if el.listeners[fd].network == "udp" {
+		return el.readUDP(fd, ev, flags)
 	}
 
-	nfd, sa, err := unix.Accept(el.ln.fd)
-	if err != nil {
-		if err == unix.EAGAIN {
-			return nil
+	nfd, sa, err := socket.Accept(fd)
+	switch err {
+	case nil:
+	case unix.EINTR, unix.EAGAIN, unix.ECONNRESET, unix.ECONNABORTED:
+		// ECONNRESET or ECONNABORTED could indicate that a socket
+		// in the Accept queue was closed before we Accept()ed it.
+		// It's a silly error, let's retry it.
+		return nil
+	default:
+		el.getLogger().Errorf("Accept() failed due to error: %v", err)
+		return errors.ErrAcceptSocket
+	}
+
+	remoteAddr := socket.SockaddrToTCPOrUnixAddr(sa)
+	if el.engine.opts.TCPKeepAlive > 0 && el.listeners[fd].network == "tcp" {
+		err = socket.SetKeepAlivePeriod(nfd, int(el.engine.opts.TCPKeepAlive/time.Second))
+		if err != nil {
+			el.getLogger().Errorf("failed to set TCP keepalive on fd=%d: %v", fd, err)
 		}
-		el.getLogger().Errorf("Accept() fails due to error: %v", err)
-		return os.NewSyscallError("accept", err)
-	}
-	if err = os.NewSyscallError("fcntl nonblock", unix.SetNonblock(nfd, true)); err != nil {
-		return err
 	}
 
-	netAddr := socket.SockaddrToTCPOrUnixAddr(sa)
-	c := newTCPConn(nfd, el, sa, netAddr)
-	if err = el.poller.AddRead(c.pollAttachment); err == nil {
-		el.connections[c.fd] = c
-		return el.loopOpen(c)
-	}
-	return err
+	c := newTCPConn(nfd, el, sa, el.listeners[fd].addr, remoteAddr)
+	return el.register0(c)
 }
